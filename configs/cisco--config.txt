@@ -1,0 +1,833 @@
+=== SOLUTION ARCHITECTURE BLUEPRINT ===
+
+Device Models and Roles:
+- Router: Cisco ISR4451-X - Core Router #1 (AS 65001)
+- Router: Cisco ISR4451-X - Core Router #2 (AS 65002)
+- Switch: Cisco C9300-48T - Distribution Switch #1
+- Switch: Cisco C9300-48T - Distribution Switch #2
+- Switch: Cisco C9200-24P - Access Switch #1
+- Switch: Cisco C9200-24P - Access Switch #2
+- Firewall: Cisco Firepower 2110 - Enterprise Edge Security
+
+Network Topology Description:
+- Dual-core design with two ISR4451-X routers, each in a different BGP AS (65001/65002)
+- eBGP peering over a dedicated /30 subnet (10.10.255.0/30)
+- Redundant distribution switches linked to both core routers via routed links and trunks for high availability
+- Access layer switches aggregated to both distribution switches with port-security, access control, and AAA
+- Firewall at enterprise edge segmenting core and providing network perimeter defense, logging, and threat detection
+- All inter-switch links (trunk) and routed interfaces (SVI, routed port) employ standardized VLANs, best-practice descriptions, ACLs, and robust monitoring
+- OSPF is used internally (Area 0) for dynamic routing minus the eBGP used between core routers
+- Router and firewall provide full audit, compliance, AAA, and logging functions
+
+CRITICAL P2P VALIDATION REQUIREMENTS:
+1. P2P links: 10.10.255.0/30 assigned with matching interface descriptions referencing peer devices/interfaces
+2. VLAN trunks: Match VLANs on both trunk ports, identical native, allowed VLANs
+3. OSPF Areas: Area 0 for all internal uplinks and downlinks, matched at both sides
+
+---
+
+=== DEVICE 1: CORE-R1 (ISR4451-X) ===
+! ===== SECTION: Basic Configuration =====
+hostname CORE-R1
+!
+service password-encryption
+no ip domain-lookup
+ip domain-name corp.example.com
+clock timezone UTC 0
+!
+username admin secret 9 $9$k.wGc5edcWVyL8k$wQfGA5tcmN7xxd6ZtjSkPQ
+!
+aaa new-model
+aaa authentication login default local
+aaa authorization exec default local
+!
+enable secret 9 $9$5rEScQ780o$cy.HIdmUSwDrc$MechBlRvX
+!
+ip ssh version 2
+ip ssh authentication-retries 3
+ip ssh time-out 60
+!
+banner motd ^C
+** Authorized access only! All activity monitored and logged. **
+^C
+!
+logging buffered 16384 warnings
+logging host 10.20.1.10
+logging trap informational
+!
+crypto key generate rsa modulus 4096
+!
+ntp server 10.20.1.2
+!
+ip name-server 8.8.8.8
+ip name-server 8.8.4.4
+!
+! ===== END SECTION =====
+
+! ===== SECTION: Interface Configuration =====
+!
+interface GigabitEthernet0/0/0
+ description eBGP-Peer to CORE-R2 Gi0/0/0
+ ip address 10.10.255.1 255.255.255.252
+ ip ospf network point-to-point
+ ip ospf 1 area 0
+ no shutdown
+!
+interface GigabitEthernet0/0/1
+ description Uplink to DIST1 Gi0/1
+ ip address 10.10.1.1 255.255.255.252
+ ip ospf 1 area 0
+ no shutdown
+!
+interface GigabitEthernet0/0/2
+ description Uplink to DIST2 Gi0/1
+ ip address 10.10.2.1 255.255.255.252
+ ip ospf 1 area 0
+ no shutdown
+!
+interface Loopback0
+ description Router-ID / Management
+ ip address 10.255.1.1 255.255.255.255
+!
+! ===== END SECTION =====
+
+! ===== SECTION: VLAN & Routing SVIs =====
+interface Vlan10
+ description Internal Mgmt VLAN
+ ip address 10.10.10.1 255.255.255.0
+ standby 10 ip 10.10.10.254
+ standby 10 priority 110
+ standby 10 preempt
+!
+interface Vlan20
+ description Data VLAN
+ ip address 10.10.20.1 255.255.255.0
+ standby 20 ip 10.10.20.254
+ standby 20 priority 110
+ standby 20 preempt
+!
+! ===== END SECTION =====
+
+! ===== SECTION: Routing Protocols =====
+router ospf 1
+ router-id 10.255.1.1
+ passive-interface default
+ no passive-interface GigabitEthernet0/0/0
+ no passive-interface GigabitEthernet0/0/1
+ no passive-interface GigabitEthernet0/0/2
+ network 10.10.1.0 0.0.0.3 area 0
+ network 10.10.2.0 0.0.0.3 area 0
+ network 10.10.255.0 0.0.0.3 area 0
+ network 10.255.1.1 0.0.0.0 area 0
+ network 10.10.10.0 0.0.0.255 area 0
+ network 10.10.20.0 0.0.0.255 area 0
+!
+router bgp 65001
+ bgp log-neighbor-changes
+ bgp router-id 10.255.1.1
+ neighbor 10.10.255.2 remote-as 65002
+ neighbor 10.10.255.2 description eBGP to CORE-R2
+ neighbor 10.10.255.2 ebgp-multihop 2
+ neighbor 10.10.255.2 timers 30 90
+ neighbor 10.10.255.2 update-source GigabitEthernet0/0/0
+!
+ address-family ipv4
+  network 10.10.10.0 mask 255.255.255.0
+  network 10.10.20.0 mask 255.255.255.0
+  neighbor 10.10.255.2 activate
+ exit-address-family
+!
+! ===== END SECTION =====
+
+! ===== SECTION: Security & Management =====
+!
+ip access-list standard MANAGEMENT
+ permit 10.10.10.0 0.0.0.255
+ deny   any
+!
+ip access-list extended RESTRICTED_MGMT
+ permit tcp 10.10.10.0 0.0.0.255 any eq 22
+ deny ip any any log
+!
+line vty 0 4
+ access-class MANAGEMENT in
+ login local
+ exec-timeout 10 0
+ transport input ssh
+!
+snmp-server community SECureR0 ASC snmp
+snmp-server enable traps bgp
+snmp-server host 10.20.1.10 version 2c SECureR0
+!
+ip route 0.0.0.0 0.0.0.0 10.10.255.2 name DEFAULT_TO_ISP
+!
+ip tcp synwait-time 10
+!
+service timestamps debug datetime msec
+service timestamps log datetime msec
+!
+archive
+ path flash:config-archive
+ write-memory
+!
+! Security hardening
+ip dhcp snooping
+ip source-route disable
+no cdp run
+no ip http server
+no ip http secure-server
+!
+! Logging for compliance
+logging buffer-size 262144
+logging userinfo
+!
+copy running-config startup-config
+! ===== END SECTION =====
+
+---
+
+=== DEVICE 2: CORE-R2 (ISR4451-X) ===
+! ===== SECTION: Basic Configuration =====
+hostname CORE-R2
+!
+service password-encryption
+no ip domain-lookup
+ip domain-name isp.example.net
+clock timezone UTC 0
+!
+username admin secret 9 $9$B98GWnIbB1PtDx$kxiVXR9V8tj1uyaF
+!
+aaa new-model
+aaa authentication login default local
+aaa authorization exec default local
+!
+enable secret 9 $9$.ccdtIOt7U$uad7e8SB71Ylc.
+!
+ip ssh version 2
+ip ssh authentication-retries 3
+ip ssh time-out 60
+!
+banner motd ^C
+** ISP Edge - Authorized personnel only! **
+^C
+!
+logging buffered 16384 warnings
+logging host 10.30.1.10
+logging trap informational
+!
+crypto key generate rsa modulus 4096
+!
+ntp server 10.30.1.2
+!
+ip name-server 1.1.1.1
+ip name-server 8.8.8.8
+!
+! ===== END SECTION =====
+
+! ===== SECTION: Interface Configuration =====
+!
+interface GigabitEthernet0/0/0
+ description eBGP-Peer to CORE-R1 Gi0/0/0
+ ip address 10.10.255.2 255.255.255.252
+ ip ospf network point-to-point
+ ip ospf 1 area 0
+ no shutdown
+!
+interface GigabitEthernet0/0/1
+ description Uplink to DIST1 Gi0/2
+ ip address 10.20.1.1 255.255.255.252
+ ip ospf 1 area 0
+ no shutdown
+!
+interface GigabitEthernet0/0/2
+ description Uplink to DIST2 Gi0/2
+ ip address 10.20.2.1 255.255.255.252
+ ip ospf 1 area 0
+ no shutdown
+!
+interface Loopback0
+ description Router-ID / Management
+ ip address 10.255.2.1 255.255.255.255
+!
+! ===== END SECTION =====
+
+! ===== SECTION: VLAN & Routing SVIs =====
+interface Vlan30
+ description ISP Mgmt VLAN
+ ip address 10.20.30.1 255.255.255.0
+ standby 30 ip 10.20.30.254
+ standby 30 priority 110
+ standby 30 preempt
+!
+interface Vlan40
+ description ISP Customer VLAN
+ ip address 10.20.40.1 255.255.255.0
+ standby 40 ip 10.20.40.254
+ standby 40 priority 110
+ standby 40 preempt
+!
+! ===== END SECTION =====
+
+! ===== SECTION: Routing Protocols =====
+router ospf 1
+ router-id 10.255.2.1
+ passive-interface default
+ no passive-interface GigabitEthernet0/0/0
+ no passive-interface GigabitEthernet0/0/1
+ no passive-interface GigabitEthernet0/0/2
+ network 10.20.1.0 0.0.0.3 area 0
+ network 10.20.2.0 0.0.0.3 area 0
+ network 10.10.255.0 0.0.0.3 area 0
+ network 10.255.2.1 0.0.0.0 area 0
+ network 10.20.30.0 0.0.0.255 area 0
+ network 10.20.40.0 0.0.0.255 area 0
+!
+router bgp 65002
+ bgp log-neighbor-changes
+ bgp router-id 10.255.2.1
+ neighbor 10.10.255.1 remote-as 65001
+ neighbor 10.10.255.1 description eBGP to CORE-R1
+ neighbor 10.10.255.1 ebgp-multihop 2
+ neighbor 10.10.255.1 timers 30 90
+ neighbor 10.10.255.1 update-source GigabitEthernet0/0/0
+!
+ address-family ipv4
+  network 10.20.30.0 mask 255.255.255.0
+  network 10.20.40.0 mask 255.255.255.0
+  neighbor 10.10.255.1 activate
+ exit-address-family
+!
+! ===== END SECTION =====
+
+! ===== SECTION: Security & Management =====
+!
+ip access-list standard ISP_MANAGEMENT
+ permit 10.20.30.0 0.0.0.255
+ deny   any
+!
+ip access-list extended RESTRICTED_ISP_MGMT
+ permit tcp 10.20.30.0 0.0.0.255 any eq 22
+ deny ip any any log
+!
+line vty 0 4
+ access-class ISP_MANAGEMENT in
+ login local
+ exec-timeout 10 0
+ transport input ssh
+!
+snmp-server community SECureR0 ASC snmp
+snmp-server enable traps bgp
+snmp-server host 10.30.1.10 version 2c SECureR0
+!
+ip route 0.0.0.0 0.0.0.0 10.10.255.1 name DEFAULT_TO_CUSTOMER
+!
+ip tcp synwait-time 10
+!
+service timestamps debug datetime msec
+service timestamps log datetime msec
+!
+archive
+ path flash:config-archive
+ write-memory
+!
+ip dhcp snooping
+ip source-route disable
+no cdp run
+no ip http server
+no ip http secure-server
+!
+logging buffer-size 262144
+logging userinfo
+!
+copy running-config startup-config
+! ===== END SECTION =====
+
+---
+
+=== DEVICE 3: DIST1 (C9300-48T) ===
+! ===== SECTION: Basic Configuration =====
+hostname DIST1
+!
+service password-encryption
+ip domain-name corp.example.com
+username admin secret 9 $9$kWrfeMlp5ToF32$3fC7KexUXuWnUF
+!
+aaa new-model
+aaa authentication login default local
+!
+enable secret 9 $9$7.AVJk9d9$09krQ8L9JjG7LoD
+!
+ip ssh version 2
+!
+banner motd ^C
+** Distribution Layer #1 **
+^C
+!
+logging host 10.20.1.10
+ntp server 10.20.1.2
+! ===== END SECTION =====
+
+! ===== SECTION: VLAN & Trunking =====
+vlan 10
+ name Internal-Mgmt
+vlan 20
+ name User-Data
+vlan 99
+ name Native
+!
+interface Vlan10
+ description Internal Mgmt VLAN
+ ip address 10.10.10.2 255.255.255.0
+!
+interface Vlan20
+ description User Data VLAN
+ ip address 10.10.20.2 255.255.255.0
+!
+! ===== END SECTION =====
+
+! ===== SECTION: Interface Configuration =====
+interface GigabitEthernet1/0/1
+ description Uplink to CORE-R1 Gi0/0/1
+ switchport trunk encapsulation dot1q
+ switchport mode trunk
+ switchport trunk native vlan 99
+ switchport trunk allowed vlan 10,20,99
+ spanning-tree portfast trunk
+!
+interface GigabitEthernet1/0/2
+ description Uplink to CORE-R2 Gi0/0/1
+ switchport trunk encapsulation dot1q
+ switchport mode trunk
+ switchport trunk native vlan 99
+ switchport trunk allowed vlan 10,20,99
+ spanning-tree portfast trunk
+!
+interface GigabitEthernet1/0/3
+ description Downlink to ACC1 Gi1/0/1
+ switchport trunk encapsulation dot1q
+ switchport mode trunk
+ switchport trunk native vlan 99
+ switchport trunk allowed vlan 10,20,99
+ spanning-tree portfast trunk
+!
+interface range GigabitEthernet1/0/4-48
+ description Access Port - User/Data
+ switchport mode access
+ switchport access vlan 20
+ spanning-tree portfast
+ switchport port-security
+ switchport port-security maximum 2
+ switchport port-security violation restrict
+!
+! ===== END SECTION =====
+
+! ===== SECTION: Layer 3 Routing =====
+interface Vlan1
+ shutdown
+!
+ip routing
+ip ospf 1 area 0
+!
+ip ospf passive-interface default
+no ip ospf passive-interface Vlan10
+no ip ospf passive-interface Vlan20
+!
+! ===== END SECTION =====
+
+! ===== SECTION: Security & QoS =====
+ip access-list standard DIST1_MGMT
+ permit 10.10.10.0 0.0.0.255
+!
+line vty 0 4
+ access-class DIST1_MGMT in
+ login local
+ transport input ssh
+ exec-timeout 10 0
+!
+service timestamps debug datetime msec
+service timestamps log datetime msec
+!
+no cdp run
+!
+logging buffered 16384
+!
+copy running-config startup-config
+! ===== END SECTION =====
+
+---
+
+=== DEVICE 4: DIST2 (C9300-48T) ===
+! ===== SECTION: Basic Configuration =====
+hostname DIST2
+!
+service password-encryption
+ip domain-name corp.example.com
+username admin secret 9 $9$pkcNsXQ.tNaT1A$Sxxr6AJ4BF3MHd74
+!
+aaa new-model
+aaa authentication login default local
+!
+enable secret 9 $9$1Ck3t1ztK$4guJKdd8akWQqnTt
+!
+ip ssh version 2
+!
+banner motd ^C
+** Distribution Layer #2 **
+^C
+!
+logging host 10.20.1.10
+ntp server 10.20.1.2
+! ===== END SECTION =====
+
+! ===== SECTION: VLAN & Trunking =====
+vlan 10
+ name Internal-Mgmt
+vlan 20
+ name User-Data
+vlan 99
+ name Native
+!
+interface Vlan10
+ description Internal Mgmt VLAN
+ ip address 10.10.10.3 255.255.255.0
+!
+interface Vlan20
+ description User Data VLAN
+ ip address 10.10.20.3 255.255.255.0
+!
+! ===== END SECTION =====
+
+! ===== SECTION: Interface Configuration =====
+interface GigabitEthernet1/0/1
+ description Uplink to CORE-R1 Gi0/0/2
+ switchport trunk encapsulation dot1q
+ switchport mode trunk
+ switchport trunk native vlan 99
+ switchport trunk allowed vlan 10,20,99
+ spanning-tree portfast trunk
+!
+interface GigabitEthernet1/0/2
+ description Uplink to CORE-R2 Gi0/0/2
+ switchport trunk encapsulation dot1q
+ switchport mode trunk
+ switchport trunk native vlan 99
+ switchport trunk allowed vlan 10,20,99
+ spanning-tree portfast trunk
+!
+interface GigabitEthernet1/0/3
+ description Downlink to ACC2 Gi1/0/1
+ switchport trunk encapsulation dot1q
+ switchport mode trunk
+ switchport trunk native vlan 99
+ switchport trunk allowed vlan 10,20,99
+ spanning-tree portfast trunk
+!
+interface range GigabitEthernet1/0/4-48
+ description Access Port - User/Data
+ switchport mode access
+ switchport access vlan 20
+ spanning-tree portfast
+ switchport port-security
+ switchport port-security maximum 2
+ switchport port-security violation restrict
+!
+! ===== END SECTION =====
+
+! ===== SECTION: Layer 3 Routing =====
+interface Vlan1
+ shutdown
+!
+ip routing
+ip ospf 1 area 0
+!
+ip ospf passive-interface default
+no ip ospf passive-interface Vlan10
+no ip ospf passive-interface Vlan20
+!
+! ===== END SECTION =====
+
+! ===== SECTION: Security & QoS =====
+ip access-list standard DIST2_MGMT
+ permit 10.10.10.0 0.0.0.255
+!
+line vty 0 4
+ access-class DIST2_MGMT in
+ login local
+ transport input ssh
+ exec-timeout 10 0
+!
+service timestamps debug datetime msec
+service timestamps log datetime msec
+!
+no cdp run
+!
+logging buffered 16384
+!
+copy running-config startup-config
+! ===== END SECTION =====
+
+---
+
+=== DEVICE 5: ACC1 (C9200-24P) ===
+! ===== SECTION: Basic Configuration =====
+hostname ACC1
+service password-encryption
+ip domain-name corp.example.com
+username admin secret 9 $9$ap187w5JDg$pdYFuwW1X3J12w
+!
+aaa new-model
+aaa authentication login default local
+!
+enable secret 9 $9$6qAcYtqRPs$1WYJOPw5v17ehWMC
+!
+ip ssh version 2
+!
+banner motd ^C
+** Access Switch #1 **
+^C
+!
+logging host 10.10.10.10
+ntp server 10.10.10.20
+! ===== END SECTION =====
+
+! ===== SECTION: VLAN & Trunking =====
+vlan 10
+ name Internal-Mgmt
+vlan 20
+ name User-Data
+vlan 99
+ name Native
+!
+interface Vlan10
+ description Internal Mgmt VLAN
+ ip address 10.10.10.10 255.255.255.0
+!
+! ===== END SECTION =====
+
+! ===== SECTION: Interface Configuration =====
+interface GigabitEthernet1/0/1
+ description Uplink to DIST1 Gi1/0/3
+ switchport trunk encapsulation dot1q
+ switchport mode trunk
+ switchport trunk native vlan 99
+ switchport trunk allowed vlan 10,20,99
+ spanning-tree portfast trunk
+!
+interface range GigabitEthernet1/0/2-24
+ description Access Port - User/Data
+ switchport mode access
+ switchport access vlan 20
+ spanning-tree portfast
+ switchport port-security
+ switchport port-security maximum 2
+ switchport port-security violation restrict
+!
+! ===== END SECTION =====
+
+! ===== SECTION: Security & NAC =====
+ip access-list standard ACC1_MGMT
+ permit 10.10.10.0 0.0.0.255
+!
+line vty 0 4
+ access-class ACC1_MGMT in
+ login local
+ transport input ssh
+ exec-timeout 10 0
+!
+service timestamps debug datetime msec
+service timestamps log datetime msec
+!
+no cdp run
+!
+logging buffered 8192
+!
+copy running-config startup-config
+! ===== END SECTION =====
+
+---
+
+=== DEVICE 6: ACC2 (C9200-24P) ===
+! ===== SECTION: Basic Configuration =====
+hostname ACC2
+service password-encryption
+ip domain-name corp.example.com
+username admin secret 9 $9$a0qRCR48Qv$3wYYK47nfm
+!
+aaa new-model
+aaa authentication login default local
+!
+enable secret 9 $9$hfiUL2zsw8$9QoT6p2EH5uyN8
+!
+ip ssh version 2
+!
+banner motd ^C
+** Access Switch #2 **
+^C
+!
+logging host 10.10.10.10
+ntp server 10.10.10.20
+! ===== END SECTION =====
+
+! ===== SECTION: VLAN & Trunking =====
+vlan 10
+ name Internal-Mgmt
+vlan 20
+ name User-Data
+vlan 99
+ name Native
+!
+interface Vlan10
+ description Internal Mgmt VLAN
+ ip address 10.10.10.11 255.255.255.0
+!
+! ===== END SECTION =====
+
+! ===== SECTION: Interface Configuration =====
+interface GigabitEthernet1/0/1
+ description Uplink to DIST2 Gi1/0/3
+ switchport trunk encapsulation dot1q
+ switchport mode trunk
+ switchport trunk native vlan 99
+ switchport trunk allowed vlan 10,20,99
+ spanning-tree portfast trunk
+!
+interface range GigabitEthernet1/0/2-24
+ description Access Port - User/Data
+ switchport mode access
+ switchport access vlan 20
+ spanning-tree portfast
+ switchport port-security
+ switchport port-security maximum 2
+ switchport port-security violation restrict
+!
+! ===== END SECTION =====
+
+! ===== SECTION: Security & NAC =====
+ip access-list standard ACC2_MGMT
+ permit 10.10.10.0 0.0.0.255
+!
+line vty 0 4
+ access-class ACC2_MGMT in
+ login local
+ transport input ssh
+ exec-timeout 10 0
+!
+service timestamps debug datetime msec
+service timestamps log datetime msec
+!
+no cdp run
+!
+logging buffered 8192
+!
+copy running-config startup-config
+! ===== END SECTION =====
+
+---
+
+=== DEVICE 7: FTD-EDGE (Firepower 2110) ===
+! ===== SECTION: Basic Configuration =====
+hostname FTD-EDGE
+!
+service password-encryption
+ip domain-name corp.example.com
+username admin password 9nrmL9qAtyTSTGv encrypted privilege 15
+!
+aaa authentication login console LOCAL
+aaa authentication ssh console LOCAL
+!
+enable password 9uwRsdjF9o encrypted
+!
+logging buffer-size 131072
+logging trap warnings
+logging host 10.10.10.10
+!
+clock timezone UTC 0
+ntp server 10.10.10.20
+!
+! ===== END SECTION =====
+
+! ===== SECTION: Interface Configuration =====
+interface GigabitEthernet1/1
+ description Outside/Public Internet
+ no shutdown
+ nameif outside
+ security-level 0
+ ip address dhcp setroute
+!
+interface GigabitEthernet1/2
+ description Inside/Core
+ no shutdown
+ nameif inside
+ security-level 100
+ ip address 10.10.10.254 255.255.255.0 standby 10.10.10.253
+!
+interface GigabitEthernet1/3
+ description DMZ
+ no shutdown
+ nameif dmz
+ security-level 50
+ ip address 10.10.50.1 255.255.255.0 standby 10.10.50.2
+!
+! ===== END SECTION =====
+
+! ===== SECTION: Firewall Security & ACL =====
+access-list OUTSIDE_IN extended permit tcp any host 10.10.10.254 eq 443
+access-list OUTSIDE_IN extended permit tcp any host 10.10.10.254 eq 22
+access-list OUTSIDE_IN extended deny ip any any log
+!
+access-group OUTSIDE_IN in interface outside
+!
+object network INTERNAL_NET
+ subnet 10.10.10.0 255.255.255.0
+ nat (inside,outside) dynamic interface
+!
+object network DMZ_SERVERS
+ subnet 10.10.50.0 255.255.255.0
+ nat (dmz,outside) dynamic interface
+!
+service-policy global_policy global
+!
+threat-detection basic-threat
+threat-detection statistics access-list
+!
+crypto key generate rsa modulus 4096
+ssh 10.10.10.0 255.255.255.0 inside
+ssh 10.10.50.0 255.255.255.0 dmz
+!
+! Compliance & SNMP
+snmp-server community SECureR0
+snmp-server host 10.10.10.10
+!
+username admin password 9sf09sf9 encrypted privilege 15
+!
+copy running-config startup-config
+! ===== END SECTION =====
+
+---
+
+=== DEPLOYMENT RECOMMENDATIONS ===
+
+Installation Sequence:
+1. Deploy and configure CORE routers (CORE-R1, CORE-R2) with interfaces, OSPF, and BGP/eBGP peering first. Verify P2P /30 assignments and neighbor relationships.
+2. Configure and connect DIST1/DIST2 switches: enable VLANs, trunks, uplinks to COREs, OSPF participation.
+3. Install ACC1/ACC2 switches: VLANs, trunk downlinks to distribution, enable port-security, deploy AAA.
+4. Position and configure FTD-EDGE firewall, assign inside/outside/DMZ addressing, apply all access-lists and NAT policies, join SNMP and AAA domains.
+5. Apply final management, AAA, syslog, and compliance controls site-wide.
+
+Verification Procedures:
+- Use `show ip bgp summary` and `show ip bgp neighbors` on both CORE routers to confirm BGP state = Established
+- Use `show cdp neighbors` and `show lldp neighbors` to confirm physical links are correct
+- Verify OSPF neighbor state (`show ip ospf neighbor`) and area consistency
+- Confirm trunk and VLAN status on all switches (`show interfaces trunk`, `show vlan brief`)
+- Confirm firewall policies with `show access-list`, NAT translations, and logging events
+- Audit AAA, login/enable privilege commands, VTY restrictions, compliance logs
+- Test syslog delivery from all devices (`show logging`), and SNMP traps
+- Validate failover by disabling primary CORE or DIST links and confirming traffic continues on redundant paths
+
+=== DEPLOYMENT SUCCESS CRITERIA ===
+
+✓ CONNECTIVITY: End-to-end Layer 3 IP connectivity across all subnets, eBGP peering established across 10.10.255.0/30  
+✓ ROUTING: OSPF and BGP/eBGP converge, routing tables populated for all VLANs and test routes  
+✓ SECURITY: AAA enforced, VTY restricted, port-security active, firewall ACLs enforced, management logs generated  
+✓ MANAGEMENT: SSH access for admins, syslog and SNMP reach central monitor, NTP syncs confirmed  
+✓ REDUNDANCY: Link, device, and routing failover validated at each tier
